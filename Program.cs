@@ -6,29 +6,35 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO; // Required for file operations
 
 namespace AngorFounderSpend
 {
     class Program
     {
         // Constants
-        private const string WalletWordPhrase = "YOUR_WALLET_WORD_PHRASE"; // Replace with actual phrase
+        private const string WalletWordPhrase = "area frost rapid guitar salon tower bless fly where inmate trouble daughter"; // This is testnet replace with actual mainnet phrase
         private const string MainnetIndexerUrl = "https://angor.shreddertest.xyz/api/v1";
         private const string TestnetIndexerUrl = "https://test.explorer.angor.io/api/v1";
-        private const string PayoutAddress = "YOUR_PAYOUT_ADDRESS"; // Replace with actual address
-        
+        private const string PayoutAddress = ""; // Replace with actual address
+        private const string CacheFileName = "angor_spend_cache.json"; // Cache file
+
         private static string _indexerUrl = TestnetIndexerUrl; // Default to testnet
         private static Network _network = Network.TestNet; // Default to testnet
         private static string _currencySymbol = "TBTC"; // Default to testnet symbol
 
         private static readonly HttpClient httpClient = new HttpClient();
-        private static readonly List<UnspentOutput> unspentOutputs = new List<UnspentOutput>();
+        // Use Dictionary for unique UTXOs, key is "TxId:Vout"
+        private static readonly Dictionary<string, UnspentOutput> unspentOutputs = new Dictionary<string, UnspentOutput>(); 
         private static long totalValue = 0;
 
         static async Task Main(string[] args)
         {
             Console.WriteLine("Angor Founder Spend Tool");
             Console.WriteLine("-------------------------");
+
+            // Load cached UTXOs first
+            LoadCache();
             
             // Parse command line arguments
             ParseCommandLineArgs(args);
@@ -37,15 +43,117 @@ namespace AngorFounderSpend
             Console.WriteLine($"Currency: {_currencySymbol}");
             Console.WriteLine($"Indexer URL: {_indexerUrl}");
 
-            // Discover all projects
-            await DiscoverProjects();
+            // Display initially loaded cache summary
+            DisplaySummary("Loaded from cache");
 
-            // Display total and ask about spending
+            // Ask user if they want to rescan or use cache
+            Console.Write("Do you want to perform a full rescan? (yes/no, default: no): ");
+            string rescanResponse = Console.ReadLine()?.ToLower() ?? "no";
+
+            if (rescanResponse == "yes" || rescanResponse == "y")
+            {
+                 Console.WriteLine("Performing full rescan...");
+                 unspentOutputs.Clear(); // Clear cache if rescanning
+                 totalValue = 0;
+                 await DiscoverProjects();
+                 RecalculateTotalValue(); // Recalculate total after discovery
+                 SaveCache(); // Save the newly discovered state
+                 DisplaySummary("After full rescan");
+            }
+            else if (unspentOutputs.Count == 0)
+            {
+                 Console.WriteLine("Cache is empty, performing initial scan...");
+                 await DiscoverProjects();
+                 RecalculateTotalValue(); 
+                 SaveCache(); 
+                 DisplaySummary("After initial scan");
+            }
+            else
+            {
+                 Console.WriteLine("Using cached data. Run with 'yes' to force a full rescan.");
+            }
+
+
+            // Display total and ask about spending (using current state)
             await DisplayTotalAndSpendOption();
 
             Console.WriteLine("Press any key to exit...");
             Console.ReadKey();
         }
+
+        // --- Caching Methods ---
+
+        private static void LoadCache()
+        {
+            try
+            {
+                if (File.Exists(CacheFileName))
+                {
+                    Console.WriteLine($"Loading cache from {CacheFileName}...");
+                    string json = File.ReadAllText(CacheFileName);
+                    var cacheData = JsonConvert.DeserializeObject<CacheData>(json);
+
+                    unspentOutputs.Clear(); // Clear current before loading
+                    if (cacheData?.UnspentOutputs != null)
+                    {
+                        foreach (var utxo in cacheData.UnspentOutputs)
+                        {
+                            string key = $"{utxo.TxId}:{utxo.Vout}";
+                            unspentOutputs[key] = utxo; // Add to dictionary
+                        }
+                    }
+                    RecalculateTotalValue(); // Calculate total from loaded cache
+                    Console.WriteLine($"Loaded {unspentOutputs.Count} UTXOs from cache.");
+                }
+                else
+                {
+                    Console.WriteLine("Cache file not found. Will perform scan if needed.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading cache: {ex.Message}. Starting fresh.");
+                unspentOutputs.Clear();
+                totalValue = 0;
+            }
+        }
+
+        private static void SaveCache()
+        {
+            try
+            {
+                Console.WriteLine($"Saving {unspentOutputs.Count} UTXOs to cache file {CacheFileName}...");
+                var cacheData = new CacheData
+                {
+                    // Convert dictionary values back to list for saving
+                    UnspentOutputs = unspentOutputs.Values.ToList() 
+                };
+                string json = JsonConvert.SerializeObject(cacheData, Formatting.Indented);
+                File.WriteAllText(CacheFileName, json);
+                Console.WriteLine("Cache saved successfully.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error saving cache: {ex.Message}");
+            }
+        }
+
+        private static void RecalculateTotalValue()
+        {
+            totalValue = unspentOutputs.Values.Sum(utxo => utxo.Value);
+        }
+        
+        // Helper to display summary at different stages
+        private static void DisplaySummary(string context)
+        {
+             Money currentTotalMoney = new Money(totalValue);
+             Console.WriteLine($"\n----- Summary ({context}) -----");
+             Console.WriteLine($"Total unspent value: {currentTotalMoney} ({currentTotalMoney.ToUnit(MoneyUnit.BTC)} {_currencySymbol})");
+             Console.WriteLine($"Number of unspent outputs: {unspentOutputs.Count}");
+        }
+
+
+        // --- Existing Methods Modified for Caching ---
         
         private static void ParseCommandLineArgs(string[] args)
         {
@@ -105,12 +213,12 @@ namespace AngorFounderSpend
                     foreach (var project in projects)
                     {
                         string projectId = project["projectIdentifier"].ToString();
-                        string founderKey = project["founderKey"].ToString();
+                        string founderKey = project["founderKey"].ToString(); // Get founder key here
                         
                         Console.WriteLine($"Project: {projectId} (Founder: {founderKey})");
                         
-                        // Now let's fetch investments for this project
-                        await FetchProjectInvestments(projectId);
+                        // Pass founderKey to FetchProjectInvestments
+                        await FetchProjectInvestments(projectId, founderKey); 
                     }
                     
                     // Prepare for the next batch
@@ -124,6 +232,7 @@ namespace AngorFounderSpend
                 }
                 
                 Console.WriteLine($"Total projects processed: {totalProjects}");
+                // Recalculate total value after discovery finishes
             }
             catch (Exception ex)
             {
@@ -131,7 +240,7 @@ namespace AngorFounderSpend
             }
         }
 
-        private static async Task FetchProjectInvestments(string projectId)
+        private static async Task FetchProjectInvestments(string projectId, string founderKey)
         {
             try
             {
@@ -150,7 +259,8 @@ namespace AngorFounderSpend
                 foreach (var investment in investments)
                 {
                     string txId = investment["transactionId"].ToString();
-                    await CheckTransactionOutput(txId);
+                    // Pass founderKey to CheckTransactionOutput
+                    await CheckTransactionOutput(txId, founderKey); 
                 }
             }
             catch (Exception ex)
@@ -159,7 +269,7 @@ namespace AngorFounderSpend
             }
         }
 
-        private static async Task CheckTransactionOutput(string txId)
+        private static async Task CheckTransactionOutput(string txId, string founderKey)
         {
             try
             {
@@ -211,19 +321,31 @@ namespace AngorFounderSpend
                         // Check if output is spent
                         bool isSpent = await IsOutputSpent(txId, vout);
 
-                        Console.WriteLine($"First Output {vout}: {amount} ({valueBtc} {_currencySymbol}), Address: {scriptPubKeyAddress}, Type: {scriptPubKeyType}, Spent: {isSpent}");
+                        Console.WriteLine($"Output {vout}: {amount} ({valueBtc} {_currencySymbol}), Address: {scriptPubKeyAddress}, Type: {scriptPubKeyType}, Spent: {isSpent}");
 
-                        // Add to our total if unspent
+                        string key = $"{txId}:{vout}"; // Generate dictionary key
+
                         if (!isSpent)
                         {
-                            // Add satoshi amount to our running total
-                            totalValue += valueSats;
-                            unspentOutputs.Add(new UnspentOutput
+                            // Add or update in the dictionary, including the Address
+                            unspentOutputs[key] = new UnspentOutput
                             {
                                 TxId = txId,
                                 Vout = vout,
-                                Value = valueSats
-                            });
+                                Value = valueSats,
+                                FounderKey = founderKey,
+                                Address = scriptPubKeyAddress, // Store the address
+                                ScriptType = scriptPubKeyType // Store the script type
+                            };
+                        }
+                        else
+                        {
+                             // If it's spent, ensure it's removed from our cache dictionary if it exists
+                             if (unspentOutputs.ContainsKey(key))
+                             {
+                                 Console.WriteLine($"Output {key} is spent, removing from potential spend list.");
+                                 unspentOutputs.Remove(key);
+                             }
                         }
                     }
                     else
@@ -238,81 +360,151 @@ namespace AngorFounderSpend
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error checking transaction {txId}: {ex.Message}");
-                
-                // Add more diagnostic information
-                if (ex.InnerException != null)
-                {
-                    Console.WriteLine($"Inner Exception: {ex.InnerException.Message}");
-                }
+                 Console.WriteLine($"Error checking transaction {txId}: {ex.Message}");
+                 // Add more diagnostic information
+                 if (ex.InnerException != null)
+                 {
+                     Console.WriteLine($"Inner Exception: {ex.InnerException.Message}");
+                 }
             }
         }
 
         private static async Task<bool> IsOutputSpent(string txId, int vout)
         {
+            // Use the endpoint that returns an array of spend statuses for all outputs
+            string url = $"{_indexerUrl}/tx/{txId}/outspends"; 
             try
             {
-                // Check if the output is spent by querying for spending transactions
-                var response = await httpClient.GetStringAsync($"{_indexerUrl}/query/outspend/{txId}/{vout}");
-                var spendData = JsonConvert.DeserializeObject<JObject>(response);
+                HttpResponseMessage response = await httpClient.GetAsync(url);
 
-                return spendData != null && spendData["spent"].Value<bool>();
+                if (!response.IsSuccessStatusCode)
+                {
+                    string errorContent = await response.Content.ReadAsStringAsync();
+                    Console.WriteLine($"Warning/Error checking spend status array for {txId}. API response: {response.StatusCode}. URL: {url}. Content: {errorContent}");
+                    // If we can't get the array, we can't determine the status for the specific vout
+                    return false; // Cautiously assume unspent, but log indicates uncertainty
+                }
+
+                string jsonContent = await response.Content.ReadAsStringAsync();
+                
+                if (string.IsNullOrWhiteSpace(jsonContent))
+                {
+                     Console.WriteLine($"Warning: Empty response checking spend status array for {txId}. Assuming unspent. URL: {url}");
+                     return false;
+                }
+
+                // Attempt to parse the JSON array
+                try 
+                {
+                    // Deserialize into a list of dynamic objects (or a specific class if defined)
+                    var spendStatusArray = JsonConvert.DeserializeObject<List<dynamic>>(jsonContent);
+                    
+                    // Check if the array is valid and the vout index is within bounds
+                    if (spendStatusArray == null || vout < 0 || vout >= spendStatusArray.Count)
+                    {
+                        Console.WriteLine($"Warning: Spend status array for {txId} is null, empty, or vout {vout} is out of bounds (Array size: {spendStatusArray?.Count ?? 0}). Assuming unspent.");
+                        return false;
+                    }
+
+                    // Access the element at the vout index
+                    var outputStatus = spendStatusArray[vout];
+
+                    // Check if the 'spent' property exists and is explicitly true
+                    if (outputStatus != null && outputStatus.spent != null && outputStatus.spent == true)
+                    {
+                        return true; // Explicitly marked as spent at this index
+                    }
+                    else
+                    {
+                        // Assume unspent if 'spent' is false, null, or the property doesn't exist at this index
+                        return false; 
+                    }
+                }
+                catch (JsonException jsonEx)
+                {
+                     Console.WriteLine($"Error parsing JSON array response for {txId}: {jsonEx.Message}. Response: {jsonContent}. Assuming unspent.");
+                     return false; // Error during parsing, assume unspent cautiously
+                }
             }
-            catch
+            catch (HttpRequestException httpEx)
             {
-                // If we can't determine, assume it's unspent
-                return false;
+                // Network or fundamental request error
+                Console.WriteLine($"HTTP Error checking spend status array for {txId}: {httpEx.Message}. URL: {url}. Assuming unspent.");
+                return false; // Network error, assume unspent cautiously
+            }
+             catch (Exception ex)
+            {
+                // Catch-all for other unexpected errors
+                Console.WriteLine($"Unexpected Error checking spend status array for {txId}: {ex.Message}. Assuming unspent.");
+                return false; // Unexpected error, assume unspent cautiously
             }
         }
 
         private static async Task DisplayTotalAndSpendOption()
         {
-            // Create Money object from total satoshis
-            Money totalMoney = new Money(totalValue);
-            
-            Console.WriteLine("\n----- Summary -----");
-            Console.WriteLine($"Total unspent value: {totalMoney} ({totalMoney.ToUnit(MoneyUnit.BTC)} {_currencySymbol})");
-            Console.WriteLine($"Number of unspent outputs: {unspentOutputs.Count}");
-            
             if (unspentOutputs.Count > 0)
             {
-                Console.Write("\nDo you want to spend these coins? (yes/no): ");
-                string response = Console.ReadLine().ToLower();
+                Console.Write($"\nThere are {unspentOutputs.Count} unspent outputs available. Do you want to spend some? (yes/no): ");
+                string response = Console.ReadLine()?.ToLower() ?? "no";
                 
                 if (response == "yes" || response == "y")
                 {
-                    await CreateAndSendTransaction();
+                    int countToSpend = 0;
+                    bool validInput = false;
+                    while (!validInput)
+                    {
+                        Console.Write($"How many inputs do you want to spend? (1-{unspentOutputs.Count}): ");
+                        string countInput = Console.ReadLine();
+                        if (int.TryParse(countInput, out countToSpend) && countToSpend > 0 && countToSpend <= unspentOutputs.Count)
+                        {
+                            validInput = true;
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Invalid input. Please enter a number between 1 and {unspentOutputs.Count}.");
+                        }
+                    }
+
+                    // Select the first 'countToSpend' UTXOs from the dictionary values
+                    List<UnspentOutput> outputsToSpend = unspentOutputs.Values.Take(countToSpend).ToList();
+                    
+                    Console.WriteLine($"Selected {outputsToSpend.Count} inputs to spend:");
+                    foreach (var utxo in outputsToSpend)
+                    {
+                         Money utxoAmount = new Money(utxo.Value);
+                         Console.WriteLine($"- {utxo.TxId}:{utxo.Vout} ({utxoAmount.ToUnit(MoneyUnit.BTC)} {_currencySymbol})");
+                    }
+
+                    await CreateAndSendTransaction(outputsToSpend); 
                 }
                 else
                 {
                     Console.WriteLine("Transaction creation cancelled.");
                 }
             }
+             else
+             {
+                 Console.WriteLine("\nNo unspent outputs available to spend.");
+             }
         }
 
-        private static Key GeneratePrivateKeyFromWords(string words)
-        {
-            // Placeholder method - to be implemented later
-            Console.WriteLine("Private key generation will be implemented later.");
-            // This will be replaced with actual implementation once provided
-            return null;
-        }
-
-        private static async Task CreateAndSendTransaction()
+        // Modify CreateAndSendTransaction to remove only spent UTXOs from cache
+        private static async Task CreateAndSendTransaction(List<UnspentOutput> outputsToSpend)
         {
             try
             {
-                Console.WriteLine("Creating transaction...");
-                
-                // Display the UTXOs that will be spent
-                Console.WriteLine("Will create a transaction with the following inputs:");
-                foreach (var utxo in unspentOutputs)
-                {
-                    Money utxoAmount = new Money(utxo.Value);
-                    Console.WriteLine($"- {utxo.TxId}:{utxo.Vout} ({utxoAmount} - {utxoAmount.ToUnit(MoneyUnit.BTC)} {_currencySymbol})");
-                }
-                
-                Console.WriteLine($"Will send to address: {PayoutAddress}");
+                 if (outputsToSpend == null || !outputsToSpend.Any())
+                 {
+                      Console.WriteLine("No outputs selected to spend.");
+                      return;
+                 }
+
+                // Calculate total value of selected inputs for display/confirmation
+                long selectedValue = outputsToSpend.Sum(o => o.Value);
+                Money selectedMoney = Money.Satoshis(selectedValue);
+
+                Console.WriteLine($"\nPreparing to spend {outputsToSpend.Count} inputs with a total value of {selectedMoney} ({selectedMoney.ToUnit(MoneyUnit.BTC)} {_currencySymbol}).");
+                Console.WriteLine($"Sending to address: {PayoutAddress}");
                 
                 // Ask for confirmation
                 Console.Write("Proceed with transaction creation? (yes/no): ");
@@ -323,25 +515,42 @@ namespace AngorFounderSpend
                     return;
                 }
                 
-                // Use the new TransactionSender class to create and broadcast the transaction
                 var transactionSender = new TransactionSender(
                     httpClient, 
                     _indexerUrl, 
                     _network, 
                     PayoutAddress);
                 
-                string txId = await transactionSender.CreateAndSendTransaction(unspentOutputs, WalletWordPhrase);
+                // Pass the selected list to the sender
+                string txId = await transactionSender.CreateAndSendTransaction(outputsToSpend, WalletWordPhrase); 
                 
                 if (!string.IsNullOrEmpty(txId))
                 {
-                    // If transaction was successful, clear the list of unspent outputs
-                    unspentOutputs.Clear();
-                    totalValue = 0;
+                    // If transaction was successful, remove the spent UTXOs from the main dictionary
+                    Console.WriteLine("Removing spent outputs from local state and saving cache...");
+                    int removedCount = 0;
+                    foreach (var spentUtxo in outputsToSpend)
+                    {
+                        string key = $"{spentUtxo.TxId}:{spentUtxo.Vout}";
+                        if (unspentOutputs.Remove(key))
+                        {
+                             removedCount++;
+                        }
+                    }
+                    Console.WriteLine($"Removed {removedCount} spent UTXOs from the list.");
+                    RecalculateTotalValue(); // Update the total value based on remaining UTXOs
+                    SaveCache(); // Save the updated state
+                    DisplaySummary("After spending"); // Show summary of remaining UTXOs
                 }
+                 else
+                 {
+                      Console.WriteLine("Transaction broadcast was cancelled or failed. Local UTXO state remains unchanged.");
+                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error creating transaction: {ex.Message}");
+                 Console.WriteLine($"Stack Trace: {ex.StackTrace}"); // Keep stack trace for debugging
             }
         }
     }

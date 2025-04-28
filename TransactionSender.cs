@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading.Tasks;
 using NBitcoin;
+using NBitcoin.Crypto; // Required for Hashes
+using NBitcoin.DataEncoders; // Required for Bech32Encoder if used elsewhere
 using Newtonsoft.Json;
 using System.Text;
 using System.Linq;
@@ -24,104 +26,169 @@ namespace AngorFounderSpend
             _payoutAddress = payoutAddress;
         }
 
+        // --- Key Derivation Methods (Unchanged) ---
+
+        private ExtKey CreateAngorRootPrivateKey(string words)
+        {
+            if (string.IsNullOrWhiteSpace(words))
+            {
+                throw new ArgumentNullException(nameof(words), "Wallet words cannot be empty.");
+            }
+
+            var mnemonic = new Mnemonic(words);
+            // Use empty passphrase "" as per the example
+            // Replace HdOperations().GetExtendedKey with mnemonic.DeriveExtKey
+            var extkey = mnemonic.DeriveExtKey(""); 
+            var path = new KeyPath("m/5'"); // Angor root path
+            return extkey.Derive(path);
+        }
+
+        private uint DeriveUniqueProjectIdentifier(string founderKeyHex)
+        {
+             if (string.IsNullOrWhiteSpace(founderKeyHex))
+            {
+                throw new ArgumentNullException(nameof(founderKeyHex), "Founder key cannot be empty.");
+            }
+            
+            var key = new PubKey(founderKeyHex);
+            var hashOfId = NBitcoin.Crypto.Hashes.DoubleSHA256(key.ToBytes());
+            // Mask with int.MaxValue (0x7FFFFFFF) to ensure it's positive and fits in 31 bits for derivation?
+            // This matches the example logic. Note: Standard BIP32 uses 31 bits for non-hardened derivation.
+            var upi = (uint)(hashOfId.GetLow64() & int.MaxValue); 
+
+            // The check for >= 2_147_483_648 seems redundant because of the & int.MaxValue mask, 
+            // but we keep it for consistency with the provided example.
+            if (upi >= 2_147_483_648) 
+                throw new InvalidOperationException($"Derived UPI {upi} is out of the expected range for founder key {founderKeyHex}.");
+
+            Console.WriteLine($"DeriveUniqueProjectIdentifier - founderKey = {founderKeyHex}, upi = {upi}");
+            return upi;
+        }
+
+        // --- Updated CreateAndSendTransaction using TransactionBuilder ---
+
         public async Task<string> CreateAndSendTransaction(List<UnspentOutput> unspentOutputs, string walletWords)
         {
             try
             {
-                Console.WriteLine("Creating transaction...");
+                Console.WriteLine("Creating transaction using TransactionBuilder...");
                 
-                // Validate inputs
-                if (unspentOutputs == null || !unspentOutputs.Any())
-                {
-                    throw new ArgumentException("No unspent outputs provided to spend");
-                }
-                
-                if (string.IsNullOrEmpty(_payoutAddress))
-                {
-                    throw new ArgumentException("No payout address specified");
-                }
-
-                // Parse the payout address to ensure it's valid for the current network
+                // --- Validation (Unchanged) ---
+                if (unspentOutputs == null || !unspentOutputs.Any()) throw new ArgumentException("No unspent outputs provided to spend");
+                if (string.IsNullOrEmpty(_payoutAddress)) throw new ArgumentException("No payout address specified");
                 BitcoinAddress payoutBitcoinAddress;
-                try
-                {
-                    payoutBitcoinAddress = BitcoinAddress.Create(_payoutAddress, _network);
-                }
-                catch (Exception ex)
-                {
-                    throw new ArgumentException($"Invalid payout address for {_network}: {ex.Message}");
-                }
+                try { payoutBitcoinAddress = BitcoinAddress.Create(_payoutAddress, _network); }
+                catch (Exception ex) { throw new ArgumentException($"Invalid payout address for {_network}: {ex.Message}"); }
 
-                // Generate the private key from wallet words
-                Key privateKey = GeneratePrivateKeyFromWords(walletWords);
-                if (privateKey == null)
-                {
-                    throw new InvalidOperationException("Failed to generate private key from wallet words");
-                }
+                // --- Key Generation (Unchanged) ---
+                ExtKey rootPrivateKey = CreateAngorRootPrivateKey(walletWords);
+                Console.WriteLine($"Using Angor Root Key (derived from path m/5')");
 
-                // Create the transaction
-                var transaction = Transaction.Create(_network);
-
-                // Add inputs
+                // --- Prepare Coins and Keys ---
                 Money totalInput = Money.Zero;
+                List<Coin> coinsToSpend = new List<Coin>();
+                List<Key> signingKeys = new List<Key>(); // Store keys needed for signing
+
                 foreach (var utxo in unspentOutputs)
                 {
-                    var outpoint = new OutPoint(uint256.Parse(utxo.TxId), utxo.Vout);
-                    transaction.Inputs.Add(new TxIn(outpoint));
-                    totalInput += new Money(utxo.Value);
-                }
-
-                // Calculate fee (simple estimation: 1000 satoshis per input + 500 for output)
-                Money fee = new Money(unspentOutputs.Count * 1000 + 500);
-                
-                // Calculate payout amount (total input minus fee)
-                Money payoutAmount = totalInput - fee;
-                
-                if (payoutAmount <= Money.Zero)
-                {
-                    throw new InvalidOperationException("Transaction amount too small to cover fees");
-                }
-
-                // Add output to payout address
-                transaction.Outputs.Add(new TxOut(payoutAmount, payoutBitcoinAddress.ScriptPubKey));
-
-                // Sign each input
-                for (int i = 0; i < unspentOutputs.Count; i++)
-                {
-                    var utxo = unspentOutputs[i];
-                    
-                    // Get the UTXO script pub key for signing
+                    // 1. Get ScriptPubKey and create Coin
                     var scriptPubKey = await GetScriptPubKeyForUtxo(utxo.TxId, utxo.Vout);
-                    
-                    // Create coin for signing
                     var coin = new Coin(
                         fromTxHash: uint256.Parse(utxo.TxId),
                         fromOutputIndex: (uint)utxo.Vout,
                         amount: new Money(utxo.Value),
                         scriptPubKey: scriptPubKey
                     );
-                    
-                    // Sign the input with correct parameters
-                    var signature = privateKey.Sign(transaction.GetSignatureHash(coin.GetScriptCode(), i, SigHash.All));
-                    var signatureScript = new Script(
-                        Op.GetPushOp(signature.ToDER()),
-                        Op.GetPushOp(privateKey.PubKey.ToBytes())
-                    );
-                    transaction.Inputs[i].ScriptSig = signatureScript;
+                    coinsToSpend.Add(coin);
+                    totalInput += coin.Amount;
+
+                    // 2. Derive corresponding private key
+                    if (string.IsNullOrWhiteSpace(utxo.FounderKey)) throw new InvalidOperationException($"FounderKey is missing for UTXO {utxo.TxId}:{utxo.Vout}");
+                    uint upi = DeriveUniqueProjectIdentifier(utxo.FounderKey);
+                    Key inputPrivateKey = rootPrivateKey.Derive(upi).PrivateKey;
+                    PubKey inputPubKey = inputPrivateKey.PubKey; // Get corresponding public key
+                    signingKeys.Add(inputPrivateKey); 
+
+                    // --- Verification Step ---
+                    // Derive the expected address from the derived public key (assuming P2WPKH for Angor)
+                    BitcoinWitPubKeyAddress derivedAddress = inputPubKey.WitHash.GetAddress(_network);
+                    string derivedAddressString = derivedAddress.ToString();
+
+                    Console.WriteLine($"Prepared input {coinsToSpend.Count - 1} (UTXO: {utxo.TxId}:{utxo.Vout}) using derived key for UPI {upi}.");
+                    Console.WriteLine($"   Expected Address: {derivedAddressString}");
+                    Console.WriteLine($"   UTXO Address:     {utxo.Address}");
+
+                    // Compare derived address with the address stored in the UTXO object
+                    if (string.IsNullOrEmpty(utxo.Address) || !derivedAddressString.Equals(utxo.Address, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Addresses don't match! Throw an error.
+                        throw new InvalidOperationException($"Address mismatch for UTXO {utxo.TxId}:{utxo.Vout}! Derived key does not match UTXO address. Derived: '{derivedAddressString}', UTXO: '{utxo.Address}'. Check derivation logic or founder key.");
+                    }
+                    Console.WriteLine($"   Address verification successful.");
+                    // --- End Verification Step ---
                 }
 
-                // Broadcast the transaction
+                // --- Fee Calculation (Unchanged for now, builder can estimate but we override) ---
+                Money fee = new Money(unspentOutputs.Count * 1000 + 500); // Example fee
+                Money payoutAmount = totalInput - fee;
+                if (payoutAmount <= Money.Zero) throw new InvalidOperationException("Transaction amount too small or negative after fee");
+
+                // --- Build Transaction ---
+                var builder = _network.CreateTransactionBuilder();
+                
+                // Add coins to spend and the keys required to spend them
+                builder.AddCoins(coinsToSpend);
+                builder.AddKeys(signingKeys.ToArray()); // Add all necessary private keys
+
+                // Specify the destination and amount
+                builder.Send(payoutBitcoinAddress, payoutAmount);
+
+                // Set the fee explicitly (overrides automatic estimation)
+                builder.SendFees(fee);
+
+                // Build and sign the transaction
+                Transaction transaction = builder.BuildTransaction(true); // `true` to sign
+
+                // Verify the transaction (optional but recommended)
+                if (!builder.Verify(transaction, out var errors))
+                {
+                    string errorMessages = string.Join("; ", errors.Select(e => e.ToString()));
+                    throw new InvalidOperationException($"Transaction verification failed: {errorMessages}");
+                }
+                Console.WriteLine("Transaction built and verified successfully.");
+
+                // --- Decode and Print Transaction Details ---
+                Console.WriteLine("\n--- Decoded Transaction Details ---");
+                // Use NBitcoin's ToString() for a detailed representation
+                Console.WriteLine(transaction.ToString()); 
+                Console.WriteLine("--- End Decoded Transaction Details ---");
+
+
+                // --- Display Hex and Confirm Broadcast ---
                 string txHex = transaction.ToHex();
-                string txId = await BroadcastTransaction(txHex);
-                
-                Console.WriteLine($"Transaction created and broadcast successfully!");
-                Console.WriteLine($"Transaction ID: {txId}");
-                
-                return txId;
+                Console.WriteLine("\nTransaction Hex:");
+                Console.WriteLine(txHex);
+
+                Console.Write("\nDo you want to broadcast this transaction now? (yes/no): ");
+                string confirmBroadcast = Console.ReadLine().ToLower();
+
+                if (confirmBroadcast == "yes" || confirmBroadcast == "y")
+                {
+                    string txId = await BroadcastTransaction(txHex);
+                    Console.WriteLine($"Transaction broadcast successfully!");
+                    Console.WriteLine($"Transaction ID: {txId}");
+                    return txId;
+                }
+                else
+                {
+                    Console.WriteLine("Transaction not broadcasted. You can broadcast the hex manually.");
+                    return null;
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error creating or broadcasting transaction: {ex.Message}");
+                 Console.WriteLine($"Error creating or broadcasting transaction: {ex.Message}");
+                 Console.WriteLine($"Stack Trace: {ex.StackTrace}"); 
                 if (ex.InnerException != null)
                 {
                     Console.WriteLine($"Inner Exception: {ex.InnerException.Message}");
@@ -135,34 +202,54 @@ namespace AngorFounderSpend
             // Fetch the transaction to get the script pub key for the specific output
             var response = await _httpClient.GetStringAsync($"{_indexerUrl}/tx/{txId}");
             var txData = JsonConvert.DeserializeObject<dynamic>(response);
+
+            // Add check for txData itself being null
+            if (txData == null)
+            {
+                 throw new InvalidOperationException($"Failed to deserialize transaction data for {txId}. Response was null or invalid.");
+            }
             
-            var scriptPubKeyHex = (string)txData.vout[vout].scriptpubkey;
+            // Ensure vout index is valid and vout object exists
+            var outputs = txData.vout;
+            if (outputs == null || vout >= outputs.Count || outputs[vout] == null)
+            {
+                throw new IndexOutOfRangeException($"Output index {vout} is out of range or output data is missing for transaction {txId}.");
+            }
+
+            // Directly access the scriptpubkey string property from the vout object
+            string scriptPubKeyHex = (string)outputs[vout].scriptpubkey; // Access directly as string
+
+             if (string.IsNullOrEmpty(scriptPubKeyHex))
+            {
+                 // Provide more context in the error
+                 string voutJson = outputs[vout]?.ToString() ?? "null";
+                 throw new InvalidOperationException($"ScriptPubKey hex string is missing or null for UTXO {txId}:{vout}. Vout object: {voutJson}");
+            }
             return Script.FromHex(scriptPubKeyHex);
         }
         
         private async Task<string> BroadcastTransaction(string txHex)
         {
-            // Create content to send
-            var content = new StringContent(JsonConvert.SerializeObject(new { tx = txHex }), Encoding.UTF8, "application/json");
+            // Create content to send: raw hex string with text/plain content type
+            var content = new StringContent(txHex, Encoding.UTF8, "text/plain"); // Use text/plain
             
             // Send to the blockchain API
-            var response = await _httpClient.PostAsync($"{_indexerUrl}/tx", content);
-            response.EnsureSuccessStatusCode();
-            
-            // Parse the response to get the transaction ID
+            Console.WriteLine($"Broadcasting transaction hex to {_indexerUrl}/tx");
+            var response = await _httpClient.PostAsync($"{_indexerUrl}/tx", content); // Endpoint might just be /tx
+
+            // Check response content for debugging even if status code is bad
             var responseContent = await response.Content.ReadAsStringAsync();
-            dynamic result = JsonConvert.DeserializeObject<dynamic>(responseContent);
+            Console.WriteLine($"Broadcast Response Status: {response.StatusCode}");
+            Console.WriteLine($"Broadcast Response Content: {responseContent}");
+
+            response.EnsureSuccessStatusCode(); // This will throw if status code is not 2xx
             
-            return result.txid;
-        }
-        
-        private Key GeneratePrivateKeyFromWords(string words)
-        {
-            // This is a placeholder - you'll need to implement this with the provided code
-            Console.WriteLine("Generating private key from wallet words...");
+            // If successful, the response body is expected to be the txid directly
+            // No need to parse JSON if the txid is the raw response body
+            // dynamic result = JsonConvert.DeserializeObject<dynamic>(responseContent);
+            // return result.txid;
             
-            // For now, return a dummy key (this would be replaced with actual implementation)
-            return null;
+            return responseContent; // Return the raw response content as the txid
         }
     }
 }
