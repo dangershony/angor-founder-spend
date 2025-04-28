@@ -20,6 +20,14 @@ namespace AngorFounderSpend
         private const string PayoutAddress = ""; // Replace with actual address
         private const string CacheFileName = "angor_spend_cache.json"; // Cache file
 
+        // Public constants/properties for HelpHandler (Consider security implications if sensitive)
+        public const string WalletWordPhraseForHelp = "[hidden]"; // Avoid exposing mnemonic directly
+        public const string WalletPassphraseForHelp = WalletPassphrase; // Expose passphrase status/value if needed
+        public const string PayoutAddressForHelp = PayoutAddress;
+        public const string TestnetIndexerUrlForHelp = TestnetIndexerUrl;
+        public const string MainnetIndexerUrlForHelp = MainnetIndexerUrl;
+
+
         private static string _indexerUrl = TestnetIndexerUrl; // Default to testnet
         private static Network _network = Network.TestNet; // Default to testnet
         private static string _currencySymbol = "TBTC"; // Default to testnet symbol
@@ -31,6 +39,13 @@ namespace AngorFounderSpend
 
         static async Task Main(string[] args)
         {
+            // Check for help arguments first
+            if (args.Any(arg => arg == "-?" || arg.Equals("-h", StringComparison.OrdinalIgnoreCase) || arg.Equals("--help", StringComparison.OrdinalIgnoreCase)))
+            {
+                HelpHandler.DisplayHelp();
+                return; // Exit after displaying help
+            }
+
             Console.WriteLine("Angor Founder Spend Tool");
             Console.WriteLine("-------------------------");
 
@@ -158,6 +173,8 @@ namespace AngorFounderSpend
         
         private static void ParseCommandLineArgs(string[] args)
         {
+            // Help argument is checked in Main, so no need to check here again
+
             // Check if mainnet flag is present
             if (args.Any(arg => arg.Equals("-mainnet", StringComparison.OrdinalIgnoreCase)))
             {
