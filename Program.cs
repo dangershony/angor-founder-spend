@@ -14,6 +14,7 @@ namespace AngorFounderSpend
     {
         // Constants
         private const string WalletWordPhrase = "area frost rapid guitar salon tower bless fly where inmate trouble daughter"; // This is testnet replace with actual mainnet phrase
+        private const string WalletPassphrase = ""; // Define passphrase here (or leave empty if none)
         private const string MainnetIndexerUrl = "https://angor.shreddertest.xyz/api/v1";
         private const string TestnetIndexerUrl = "https://test.explorer.angor.io/api/v1";
         private const string PayoutAddress = ""; // Replace with actual address
@@ -36,7 +37,7 @@ namespace AngorFounderSpend
             // Load cached UTXOs first
             LoadCache();
             
-            // Parse command line arguments
+            // Parse command line arguments (only for -mainnet now)
             ParseCommandLineArgs(args);
             
             Console.WriteLine($"Using network: {(_network == Network.Main ? "Mainnet" : "Testnet")}");
@@ -475,6 +476,7 @@ namespace AngorFounderSpend
                          Console.WriteLine($"- {utxo.TxId}:{utxo.Vout} ({utxoAmount.ToUnit(MoneyUnit.BTC)} {_currencySymbol})");
                     }
 
+                    // Pass the constant passphrase
                     await CreateAndSendTransaction(outputsToSpend); 
                 }
                 else
@@ -488,7 +490,7 @@ namespace AngorFounderSpend
              }
         }
 
-        // Modify CreateAndSendTransaction to remove only spent UTXOs from cache
+        // Modify CreateAndSendTransaction to pass the constant passphrase
         private static async Task CreateAndSendTransaction(List<UnspentOutput> outputsToSpend)
         {
             try
@@ -521,8 +523,8 @@ namespace AngorFounderSpend
                     _network, 
                     PayoutAddress);
                 
-                // Pass the selected list to the sender
-                string txId = await transactionSender.CreateAndSendTransaction(outputsToSpend, WalletWordPhrase); 
+                // Pass the selected list and the constant passphrase to the sender
+                string txId = await transactionSender.CreateAndSendTransaction(outputsToSpend, WalletWordPhrase, WalletPassphrase); 
                 
                 if (!string.IsNullOrEmpty(txId))
                 {

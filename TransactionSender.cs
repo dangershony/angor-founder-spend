@@ -26,9 +26,10 @@ namespace AngorFounderSpend
             _payoutAddress = payoutAddress;
         }
 
-        // --- Key Derivation Methods (Unchanged) ---
+        // --- Key Derivation Methods ---
 
-        private ExtKey CreateAngorRootPrivateKey(string words)
+        // Returns the master key (m)
+        private ExtKey CreateMasterPrivateKey(string words, string passphrase)
         {
             if (string.IsNullOrWhiteSpace(words))
             {
@@ -36,11 +37,11 @@ namespace AngorFounderSpend
             }
 
             var mnemonic = new Mnemonic(words);
-            // Use empty passphrase "" as per the example
-            // Replace HdOperations().GetExtendedKey with mnemonic.DeriveExtKey
-            var extkey = mnemonic.DeriveExtKey(""); 
-            var path = new KeyPath("m/5'"); // Angor root path
-            return extkey.Derive(path);
+            string effectivePassphrase = passphrase ?? ""; 
+            Console.WriteLine($"Deriving master key (m) using passphrase: {(string.IsNullOrEmpty(effectivePassphrase) ? "[empty]" : "[provided]")}");
+            // DeriveExtKey returns the master key (m)
+            var masterKey = mnemonic.DeriveExtKey(effectivePassphrase); 
+            return masterKey;
         }
 
         private uint DeriveUniqueProjectIdentifier(string founderKeyHex)
@@ -67,7 +68,7 @@ namespace AngorFounderSpend
 
         // --- Updated CreateAndSendTransaction using TransactionBuilder ---
 
-        public async Task<string> CreateAndSendTransaction(List<UnspentOutput> unspentOutputs, string walletWords)
+        public async Task<string> CreateAndSendTransaction(List<UnspentOutput> unspentOutputs, string walletWords, string passphrase)
         {
             try
             {
@@ -80,14 +81,30 @@ namespace AngorFounderSpend
                 try { payoutBitcoinAddress = BitcoinAddress.Create(_payoutAddress, _network); }
                 catch (Exception ex) { throw new ArgumentException($"Invalid payout address for {_network}: {ex.Message}"); }
 
-                // --- Key Generation (Unchanged) ---
-                ExtKey rootPrivateKey = CreateAngorRootPrivateKey(walletWords);
-                Console.WriteLine($"Using Angor Root Key (derived from path m/5')");
+                // --- Key Generation ---
+                // 1. Get the master private key (m)
+                ExtKey masterPrivateKey = CreateMasterPrivateKey(walletWords, passphrase); 
+                Console.WriteLine($"Using Master Key (m)");
+
+                // 2. Determine the Angor Root Key based on network
+                ExtKey angorRootKey;
+                if (_network == Network.Main)
+                {
+                    // Mainnet: Angor root is the master key itself (m)
+                    angorRootKey = masterPrivateKey;
+                    Console.WriteLine("Using Mainnet derivation (Angor Root = m)");
+                }
+                else // Testnet or other networks
+                {
+                    // Testnet: Angor root is m/5'
+                    angorRootKey = masterPrivateKey.Derive(5, hardened: true);
+                    Console.WriteLine("Using Testnet derivation (Angor Root = m/5')");
+                }
 
                 // --- Prepare Coins and Keys ---
                 Money totalInput = Money.Zero;
                 List<Coin> coinsToSpend = new List<Coin>();
-                List<Key> signingKeys = new List<Key>(); // Store keys needed for signing
+                List<Key> signingKeys = new List<Key>(); 
 
                 foreach (var utxo in unspentOutputs)
                 {
@@ -102,11 +119,16 @@ namespace AngorFounderSpend
                     coinsToSpend.Add(coin);
                     totalInput += coin.Amount;
 
-                    // 2. Derive corresponding private key
+                    // 3. Derive corresponding private key from the Angor Root Key using UPI
                     if (string.IsNullOrWhiteSpace(utxo.FounderKey)) throw new InvalidOperationException($"FounderKey is missing for UTXO {utxo.TxId}:{utxo.Vout}");
                     uint upi = DeriveUniqueProjectIdentifier(utxo.FounderKey);
-                    Key inputPrivateKey = rootPrivateKey.Derive(upi).PrivateKey;
-                    PubKey inputPubKey = inputPrivateKey.PubKey; // Get corresponding public key
+                    
+                    // Derive the final key: AngorRoot / upi
+                    Key inputPrivateKey = angorRootKey.Derive(upi).PrivateKey; 
+                    string derivationPathString = (_network == Network.Main) ? $"m/{upi}" : $"m/5'/{upi}";
+                    Console.WriteLine($"Deriving final key using path: {derivationPathString}");
+                    
+                    PubKey inputPubKey = inputPrivateKey.PubKey; 
                     signingKeys.Add(inputPrivateKey); 
 
                     // --- Verification Step ---
